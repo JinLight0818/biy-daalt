@@ -1,196 +1,184 @@
-//============================================================
-// lab9_dac_top.v
-// Spartan-3E Starter Kit – Chapter 9 DAC (LTC2624) demo
-//
-// Controls LTC2624 quad 12-bit DAC over shared SPI bus.
-//  - SW[3:0] set upper nibble of 12-bit DAC code (D[11:8])
-//  - BTN_EAST toggles lower byte D[7:0] between 0x00 and 0xFF
-//  - BTN_WEST cycles channel A->B->C->D
-//  - BTN_SOUTH is reset (clears DAC via DAC_CLR, resets UI state)
-//
-// SPI mode: CPOL=0, CPHA=0 (data valid before rising edge, captured on rising).
-// Frame format (32 bits, MSB first):
-//   [31:24] don't care, [23:20] command, [19:16] address, [15:4] data[11:0], [3:0] don't care
-// Command used: 0b0011 = "Write and Update" (update output on DAC_CS rising edge)
-//============================================================
-`timescale 1ns/1ps
-
-module lab9_dac_top (
-    input  wire        CLK_50MHZ,
-
-    input  wire [3:0]  SW,
-    input  wire        BTN_SOUTH,
-    input  wire        BTN_WEST,
-    input  wire        BTN_EAST,
-
-    output wire [7:0]  LED,
-
-    // Shared SPI bus
-    input  wire        SPI_MISO,
-    output wire        SPI_MOSI,
-    output wire        SPI_SCK,
-
-    // DAC control
-    output wire        DAC_CS,
-    output wire        DAC_CLR,
-
-    // Other devices on shared bus (force disable values to avoid contention)
-    output wire        SPI_SS_B,   // SPI Flash select (active low) -> keep High to disable
-    output wire        AMP_CS,     // AMP select (active low) -> keep High to disable
-    output wire        AD_CONV,    // ADC convert control -> keep Low to disable transactions
-    output wire        SF_CE0      // StrataFlash CE (active low) -> keep High to disable
-);
-
-    // -------------------------
-    // Disable other SPI devices
-    // -------------------------
-    assign SPI_SS_B = 1'b1;
-    assign AMP_CS   = 1'b1;
-    assign AD_CONV  = 1'b0;
-    assign SF_CE0   = 1'b1;
-
-    // -------------------------
-    // Reset + debounced buttons
-    // -------------------------
-    wire reset = BTN_SOUTH;
-
-    wire btn_west_pulse;
-    wire btn_east_pulse;
-
-    debounce #(
-        .COUNT_MAX(20'd999_999)   // ~20ms at 50MHz
-    ) u_db_west (
-        .clk(CLK_50MHZ),
-        .reset(reset),
-        .noisy(BTN_WEST),
-        .clean(),
-        .rising_pulse(btn_west_pulse)
-    );
-
-    debounce #(
-        .COUNT_MAX(20'd999_999)   // ~20ms at 50MHz
-    ) u_db_east (
-        .clk(CLK_50MHZ),
-        .reset(reset),
-        .noisy(BTN_EAST),
-        .clean(),
-        .rising_pulse(btn_east_pulse)
-    );
-
-    // -------------------------
-    // Simple UI state
-    // -------------------------
-    reg [1:0] chan_sel;        // 0=A, 1=B, 2=C, 3=D
-    reg       lo_ff;           // 0 -> low byte 0x00, 1 -> low byte 0xFF
-
-    always @(posedge CLK_50MHZ) begin
-        if (reset) begin
-            chan_sel <= 2'd0;
-            lo_ff    <= 1'b0;
-        end else begin
-            if (btn_west_pulse) begin
-                chan_sel <= chan_sel + 2'd1;
-            end
-            if (btn_east_pulse) begin
-                lo_ff <= ~lo_ff;
-            end
-        end
-    end
-
-    // 12-bit DAC code assembled from switches + lo_ff
-    wire [11:0] dac_data = { SW[3:0], (lo_ff ? 8'hFF : 8'h00) };
-
-    // Address mapping (common LTC2624 convention)
-    wire [3:0] dac_addr =
-        (chan_sel == 2'd0) ? 4'b0000 :
-        (chan_sel == 2'd1) ? 4'b0001 :
-        (chan_sel == 2'd2) ? 4'b0010 :
-                             4'b0011;
-
-    localparam [3:0] CMD_WRITE_UPDATE = 4'b0011;
-
-    // Build 32-bit SPI frame (MSB first)
-    wire [31:0] dac_frame = { 8'h00, CMD_WRITE_UPDATE, dac_addr, dac_data, 4'h0 };
-
-    // -------------------------
-    // DAC_CLR (active-low async reset to DAC)
-    // Hold low while reset button is pressed
-    // -------------------------
-    assign DAC_CLR = ~reset;
-
-    // -------------------------
-    // SPI transaction control
-    // -------------------------
-    wire        spi_busy;
-    wire        spi_done;
-    reg         spi_start;
-    reg  [31:0] frame_reg;
-
-    // Detect changes and push an update when SPI is idle
-    reg  [3:0]  sw_prev;
-    reg  [1:0]  chan_prev;
-    reg         lo_prev;
-    reg         update_pending;
-
-    always @(posedge CLK_50MHZ) begin
-        spi_start <= 1'b0;
-
-        if (reset) begin
-            sw_prev        <= 4'd0;
-            chan_prev      <= 2'd0;
-            lo_prev        <= 1'b0;
-            update_pending <= 1'b1;     // send initial value after reset
-            frame_reg      <= 32'd0;
-        end else begin
-            // Track changes
-            if (SW != sw_prev) begin
-                sw_prev        <= SW;
-                update_pending <= 1'b1;
-            end
-            if (chan_sel != chan_prev) begin
-                chan_prev      <= chan_sel;
-                update_pending <= 1'b1;
-            end
-            if (lo_ff != lo_prev) begin
-                lo_prev        <= lo_ff;
-                update_pending <= 1'b1;
-            end
-
-            // Fire a transaction when idle
-            if (!spi_busy && update_pending) begin
-                frame_reg      <= dac_frame;
-                spi_start      <= 1'b1;
-                update_pending <= 1'b0;
-            end
-
-            // If changes happen during a transfer, update_pending will be re-set above
-        end
-    end
-
-    // SPI master instance (mode 0)
-    spi_master_ltc2624 #(
-        .SCK_DIV(25) // 50MHz/(2*25)=1MHz SCK
-    ) u_spi (
-        .clk(CLK_50MHZ),
-        .reset(reset),
-        .start(spi_start),
-        .tx_data(frame_reg),
-        .miso(SPI_MISO),
-        .rx_data(),
-        .busy(spi_busy),
-        .done(spi_done),
-        .sck(SPI_SCK),
-        .mosi(SPI_MOSI),
-        .cs_n(DAC_CS)
-    );
-
-    // -------------------------
-    // LEDs (debug)
-    // LED[1:0] = channel, LED2 = lo_ff, LED3 = spi_busy, LED[7:4]=SW
-    // -------------------------
-    assign LED[1:0] = chan_sel;
-    assign LED[2]   = lo_ff;
-    assign LED[3]   = spi_busy;
-    assign LED[7:4] = SW;
-
-endmodule
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+ 
+entity dac_every_3s is
+  Port (
+    clk      : in  std_logic;   -- 50 MHz
+    reset_n  : in  std_logic;   -- active-low reset
+ 
+    spi_mosi : out std_logic;   -- T4
+    spi_sck  : out std_logic;   -- U16
+    dac_cs   : out std_logic;   -- N8 (CS/LD)
+    dac_clr  : out std_logic    -- P8 (CLR, active-low)
+  );
+end;
+ 
+architecture rtl of dac_every_3s is
+ 
+  ------------------------------------------------------------------
+  -- Clean SPI timing (tick -> SCK rise/fall) : 1MHz SCK
+  ------------------------------------------------------------------
+  constant TICK_DIV : integer := 25;   -- 50MHz/25=2MHz tick -> SCK=1MHz
+  signal tick_cnt : integer range 0 to TICK_DIV-1 := 0;
+  signal tick     : std_logic := '0';
+ 
+  type state_t is (LOAD, SHIFT_RISE, SHIFT_FALL, LATCH, GAP);
+  signal state : state_t := LOAD;
+ 
+  signal cs   : std_logic := '1';
+  signal sck  : std_logic := '0';
+  signal mosi : std_logic := '0';
+ 
+  signal shift_reg : std_logic_vector(23 downto 0) := (others=>'0');
+  signal bit_idx   : integer range 0 to 23 := 0;
+  signal gap_cnt   : integer range 0 to 31 := 0;
+ 
+  ------------------------------------------------------------------
+  -- DAC code ramp (VREF=3.3V)
+  -- START ~1.0V, STEP ~0.3V, MAX=3.3V
+  ------------------------------------------------------------------
+  constant START_CODE : integer := 200; -- ~0.15V
+  constant STEP_CODE  : integer := 372;  -- ~0.3V
+  constant MAX_CODE   : integer := 4095; -- ~3.3V (full-scale)
+ 
+  signal dac_code : integer range 0 to 4095 := START_CODE;
+ 
+  ------------------------------------------------------------------
+  -- 3-second timer (50MHz * 3s = 150,000,000 cycles)
+  ------------------------------------------------------------------
+  constant SEC3_MAX : unsigned(27 downto 0) := to_unsigned(150000000-1, 28);
+  signal sec3_cnt   : unsigned(27 downto 0) := (others=>'0');
+  signal tick_3s    : std_logic := '0';
+ 
+begin
+  dac_clr  <= '1';
+  dac_cs   <= cs;
+  spi_sck  <= sck;
+  spi_mosi <= mosi;
+ 
+  ------------------------------------------------------------------
+  -- 2MHz tick generator
+  ------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset_n='0' then
+        tick_cnt <= 0;
+        tick     <= '0';
+      else
+        if tick_cnt = TICK_DIV-1 then
+          tick_cnt <= 0;
+          tick     <= '1';
+        else
+          tick_cnt <= tick_cnt + 1;
+          tick     <= '0';
+        end if;
+      end if;
+    end if;
+  end process;
+ 
+  ------------------------------------------------------------------
+  -- 3-second tick generator
+  ------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset_n='0' then
+        sec3_cnt <= (others=>'0');
+        tick_3s  <= '0';
+      else
+        if sec3_cnt = SEC3_MAX then
+          sec3_cnt <= (others=>'0');
+          tick_3s  <= '1';
+        else
+          sec3_cnt <= sec3_cnt + 1;
+          tick_3s  <= '0';
+        end if;
+      end if;
+    end if;
+  end process;
+ 
+  ------------------------------------------------------------------
+  -- Update dac_code every 3 seconds until it reaches full-scale
+  ------------------------------------------------------------------
+  process(clk)
+    variable next_code : integer;
+  begin
+    if rising_edge(clk) then
+      if reset_n='0' then
+        dac_code <= START_CODE;
+      else
+        if tick_3s='1' then
+          next_code := dac_code + STEP_CODE;
+          if next_code > MAX_CODE then
+            next_code := MAX_CODE;
+          end if;
+          dac_code <= next_code;
+        end if;
+      end if;
+    end if;
+  end process;
+ 
+  ------------------------------------------------------------------
+  -- Clean SPI state machine (continuous frames, CH A = dac_code)
+  ------------------------------------------------------------------
+  process(clk)
+    variable data12 : std_logic_vector(11 downto 0);
+  begin
+    if rising_edge(clk) then
+      if reset_n='0' then
+        state <= LOAD;
+        cs    <= '1';
+        sck   <= '0';
+        mosi  <= '0';
+        bit_idx <= 23;
+        gap_cnt <= 0;
+        shift_reg <= (others=>'0');
+      else
+        if tick='1' then
+          case state is
+            when LOAD =>
+              data12 := std_logic_vector(to_unsigned(dac_code, 12));
+              shift_reg <= "0011" & "0000" & data12 & "0000"; -- CMD=0011, CH A
+              bit_idx   <= 23;
+              cs        <= '0';
+              sck       <= '0';
+              mosi      <= shift_reg(23);
+              state     <= SHIFT_RISE;
+ 
+            when SHIFT_RISE =>
+              sck <= '1';
+              state <= SHIFT_FALL;
+ 
+            when SHIFT_FALL =>
+              sck <= '0';
+              if bit_idx = 0 then
+                state <= LATCH;
+              else
+                bit_idx <= bit_idx - 1;
+                mosi <= shift_reg(bit_idx - 1);
+                state <= SHIFT_RISE;
+              end if;
+ 
+            when LATCH =>
+              cs <= '1';
+              sck <= '0';
+              mosi <= '0';
+              gap_cnt <= 0;
+              state <= GAP;
+ 
+            when GAP =>
+              if gap_cnt = 31 then
+                state <= LOAD;
+              else
+                gap_cnt <= gap_cnt + 1;
+              end if;
+          end case;
+        end if;
+      end if;
+    end if;
+  end process;
+ 
+end rtl;
+ 
